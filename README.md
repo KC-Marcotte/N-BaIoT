@@ -43,6 +43,9 @@ python scripts/generate_eda_visuals.py
 
 The feature names are in [`demonstrate_structure.csv`](demonstrate_structure.csv).
 
+The complete column glossary is in
+[`docs/feature_glossary.md`](docs/feature_glossary.md).
+
 Dataset paper: [N-BaIoT](docs/references/1805.03409v1%20(1).pdf).
 
 Contributor: KC-Marcotte
