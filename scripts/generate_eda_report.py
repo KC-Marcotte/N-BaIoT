@@ -14,7 +14,7 @@ import json
 import time
 import glob
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import numpy as np
 import pandas as pd
 
@@ -30,6 +30,7 @@ class DatasetMetrics:
     column_count: int
     file_size_mb: float
     null_count: int
+    selected_feature_counts: Dict[str, int] = field(default_factory=dict)
     selected_feature_means: Dict[str, float] = field(default_factory=dict)
     selected_feature_stds: Dict[str, float] = field(default_factory=dict)
     selected_feature_q25: Dict[str, float] = field(default_factory=dict)
@@ -132,6 +133,7 @@ def analyze_single_csv(csv_path: str, chunksize: int = 25000, workspace_root: st
         column_count=col_count,
         file_size_mb=round(file_size_mb, 2),
         null_count=total_nulls,
+        selected_feature_counts=feature_counts,
         selected_feature_means=means,
         selected_feature_stds=stds,
         selected_feature_q25=q25s,
@@ -140,7 +142,7 @@ def analyze_single_csv(csv_path: str, chunksize: int = 25000, workspace_root: st
     )
 
 
-def generate_markdown(metrics: List[DatasetMetrics], elapsed_sec: float) -> str:
+def generate_markdown_legacy(metrics: List[DatasetMetrics], elapsed_sec: float) -> str:
     total_files = len(metrics)
     total_records = sum(m.row_count for m in metrics)
     total_size_mb = sum(m.file_size_mb for m in metrics)
@@ -247,6 +249,300 @@ def generate_markdown(metrics: List[DatasetMetrics], elapsed_sec: float) -> str:
     return "\n".join(md)
 
 
+TRAFFIC_FAMILIES = ["benign", "gafgyt", "mirai"]
+
+
+def _percentage(value: int, total: int) -> float:
+    return round((value / total) * 100, 2) if total else 0.0
+
+
+def _family_counts(metrics: List[DatasetMetrics]) -> Dict[str, int]:
+    return {
+        family: sum(m.row_count for m in metrics if m.attack_family == family)
+        for family in TRAFFIC_FAMILIES
+    }
+
+
+def _feature_profile(metrics: List[DatasetMetrics], feature: str) -> Dict[str, float]:
+    """Combine per-file moments using valid feature counts as weights."""
+    rows = [m for m in metrics if m.selected_feature_counts.get(feature, 0) > 0]
+    count = sum(m.selected_feature_counts.get(feature, 0) for m in rows)
+    if not count:
+        return {"count": 0, "mean": 0.0, "std": 0.0}
+
+    mean = sum(
+        m.selected_feature_means.get(feature, 0.0)
+        * m.selected_feature_counts.get(feature, 0)
+        for m in rows
+    ) / count
+    second_moment = sum(
+        m.selected_feature_counts.get(feature, 0)
+        * (
+            m.selected_feature_stds.get(feature, 0.0) ** 2
+            + m.selected_feature_means.get(feature, 0.0) ** 2
+        )
+        for m in rows
+    ) / count
+    variance = max(0.0, second_moment - mean**2)
+    return {"count": count, "mean": round(mean, 4), "std": round(float(np.sqrt(variance)), 4)}
+
+
+def summarize_metrics(metrics: List[DatasetMetrics]) -> Dict[str, Any]:
+    """Build reusable aggregate data for JSON, Markdown, and visualizations."""
+    total_records = sum(m.row_count for m in metrics)
+    total_cells = sum(m.row_count * m.column_count for m in metrics)
+    total_nulls = sum(m.null_count for m in metrics)
+    family_counts = _family_counts(metrics)
+
+    category_summary = {}
+    for category in sorted({m.device_category for m in metrics}):
+        group = [m for m in metrics if m.device_category == category]
+        counts = _family_counts(group)
+        category_summary[category] = {
+            "device_count": len({m.device_name for m in group}),
+            "dataset_count": len(group),
+            "record_count": sum(m.row_count for m in group),
+            "size_mb": round(sum(m.file_size_mb for m in group), 2),
+            "family_counts": counts,
+            "family_percentages": {
+                family: _percentage(count, sum(counts.values()))
+                for family, count in counts.items()
+            },
+        }
+
+    device_summary = {}
+    for device in sorted({m.device_name for m in metrics}):
+        group = [m for m in metrics if m.device_name == device]
+        counts = _family_counts(group)
+        device_summary[device] = {
+            "device_category": group[0].device_category,
+            "dataset_count": len(group),
+            "record_count": sum(m.row_count for m in group),
+            "size_mb": round(sum(m.file_size_mb for m in group), 2),
+            "family_counts": counts,
+            "family_percentages": {
+                family: _percentage(count, sum(counts.values()))
+                for family, count in counts.items()
+            },
+        }
+
+    attack_vectors = {}
+    for m in metrics:
+        if m.attack_family == "benign":
+            continue
+        key = f"{m.attack_family}/{m.attack_name}"
+        item = attack_vectors.setdefault(
+            key,
+            {
+                "attack_family": m.attack_family,
+                "attack_name": m.attack_name,
+                "dataset_count": 0,
+                "record_count": 0,
+            },
+        )
+        item["dataset_count"] += 1
+        item["record_count"] += m.row_count
+    for item in attack_vectors.values():
+        item["average_records_per_dataset"] = round(
+            item["record_count"] / item["dataset_count"], 2
+        )
+        item["family_percentage"] = _percentage(
+            item["record_count"], family_counts.get(item["attack_family"], 0)
+        )
+
+    devices = sorted({m.device_name for m in metrics})
+    coverage = {
+        device: {
+            family: any(
+                m.device_name == device and m.attack_family == family
+                for m in metrics
+            )
+            for family in TRAFFIC_FAMILIES
+        }
+        for device in devices
+    }
+
+    column_counts = sorted({m.column_count for m in metrics})
+    return {
+        "total_datasets": len(metrics),
+        "total_records": total_records,
+        "total_size_mb": round(sum(m.file_size_mb for m in metrics), 2),
+        "total_nulls": total_nulls,
+        "total_cells": total_cells,
+        "completeness_percent": round(
+            (1 - total_nulls / total_cells) * 100 if total_cells else 100.0,
+            4,
+        ),
+        "column_counts": column_counts,
+        "family_counts": family_counts,
+        "family_percentages": {
+            family: _percentage(count, total_records)
+            for family, count in family_counts.items()
+        },
+        "category_summary": category_summary,
+        "device_summary": device_summary,
+        "device_class_coverage": coverage,
+        "attack_vectors": dict(sorted(attack_vectors.items())),
+        "feature_profiles": {
+            family: {
+                feature: _feature_profile(
+                    [m for m in metrics if m.attack_family == family], feature
+                )
+                for feature in KEY_FEATURES
+            }
+            for family in TRAFFIC_FAMILIES
+        },
+    }
+
+
+def generate_markdown(metrics: List[DatasetMetrics], elapsed_sec: float) -> str:
+    summary = summarize_metrics(metrics)
+    total_files = summary["total_datasets"]
+    total_records = summary["total_records"]
+    total_size_mb = summary["total_size_mb"]
+    total_nulls = summary["total_nulls"]
+    column_counts = summary["column_counts"]
+    categories = sorted(summary["category_summary"])
+    devices = sorted(summary["device_summary"])
+
+    if len(column_counts) == 1:
+        column_text = f"{column_counts[0]} columns in every dataset"
+    else:
+        column_text = f"{min(column_counts)}-{max(column_counts)} columns across datasets"
+
+    md = [
+        "# N-BaIoT Dataset Exploratory Data Analysis (EDA) Report\n",
+        "**Generated**: Automated Streaming Analysis Engine",
+        f"**Total Execution Time**: {elapsed_sec:.2f} seconds",
+        f"**Total CSV Datasets**: {total_files} files",
+        f"**Total Network Traffic Records**: {total_records:,} packets",
+        f"**Total Dataset Storage Volume**: {total_size_mb / 1024:.2f} GB ({total_size_mb:,.1f} MB)",
+        f"**Feature Schema**: {column_text}",
+        f"**Dataset Completeness**: {summary['completeness_percent']:.2f}% ({total_nulls:,} missing/null cells)\n",
+        "---\n",
+        "## 1. Executive Summary & Taxonomy\n",
+        f"The dataset contains **{len(devices)} IoT devices** across **{len(categories)} device categories** and **{total_files} CSV datasets**. It contains benign traffic plus two botnet families: **Mirai** and **BASHLITE / GAFGYT**.\n",
+        "| Traffic Class | Records | Share of Records |",
+        "|---|---:|---:|",
+    ]
+    for family in TRAFFIC_FAMILIES:
+        md.append(
+            f"| **{family.upper()}** | {summary['family_counts'][family]:,} | {summary['family_percentages'][family]:.2f}% |"
+        )
+    md.extend(
+        [
+            "",
+            "![Class distribution by device](figures/01_class_distribution_by_device.png)",
+            "",
+            "---\n",
+            "## 2. Summary by Device Category\n",
+            "| Category | Devices | CSVs | Records | Size (MB) | Benign | GAFGYT | Mirai |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for category in categories:
+        item = summary["category_summary"][category]
+        counts = item["family_counts"]
+        md.append(
+            f"| `{category}` | {item['device_count']} | {item['dataset_count']} | {item['record_count']:,} | {item['size_mb']:,.1f} | {counts['benign']:,} | {counts['gafgyt']:,} | {counts['mirai']:,} |"
+        )
+    md.extend(
+        [
+            "",
+            "![Category composition](figures/05_category_composition.png)",
+            "",
+            "---\n",
+            "## 3. Device Coverage and Class Balance\n",
+            "A missing class/device combination can affect how well a model generalizes beyond the observed devices.\n",
+            "| Device | Category | CSVs | Benign | GAFGYT | Mirai | Total Records |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for device in devices:
+        item = summary["device_summary"][device]
+        counts = item["family_counts"]
+        md.append(
+            f"| **{device}** | `{item['device_category']}` | {item['dataset_count']} | {counts['benign']:,} | {counts['gafgyt']:,} | {counts['mirai']:,} | **{item['record_count']:,}** |"
+        )
+    md.extend(
+        [
+            "",
+            "### Device/Class Coverage Matrix\n",
+            "| Device | Benign | GAFGYT | Mirai |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for device in devices:
+        coverage = summary["device_class_coverage"][device]
+        md.append(
+            f"| {device} | {'Yes' if coverage['benign'] else 'No'} | {'Yes' if coverage['gafgyt'] else 'No'} | {'Yes' if coverage['mirai'] else 'No'} |"
+        )
+    md.extend(
+        [
+            "",
+            "![Class balance by device](figures/02_class_balance_percent_by_device.png)",
+            "",
+            "![Device/class coverage heatmap](figures/04_device_class_heatmap.png)",
+            "",
+            "---\n",
+            "## 4. Attack Family and Vector Distribution\n",
+            "| Attack Vector | Datasets | Records | Share Within Family | Avg Records/Dataset |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for key, item in summary["attack_vectors"].items():
+        md.append(
+            f"| `{key}` | {item['dataset_count']} | {item['record_count']:,} | {item['family_percentage']:.2f}% | {item['average_records_per_dataset']:,.2f} |"
+        )
+    md.extend(
+        [
+            "",
+            "![Attack-vector distribution](figures/03_attack_vector_distribution.png)",
+            "",
+            "---\n",
+            "## 5. Key Feature Statistical Profiles\n",
+            "Profiles are combined using valid-value counts, rather than giving every CSV equal weight. Quantiles in the per-dataset catalog are estimated from bounded samples.\n",
+            "| Traffic Class | MI_dir_L5_weight (mean +/- std) | MI_dir_L5_mean | H_L5_weight | HH_jit_L5_mean |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for family in TRAFFIC_FAMILIES:
+        profiles = summary["feature_profiles"][family]
+        weight = profiles["MI_dir_L5_weight"]
+        md.append(
+            f"| **{family.upper()}** | {weight['mean']:.2f} +/- {weight['std']:.2f} | {profiles['MI_dir_L5_mean']['mean']:.2f} | {profiles['H_L5_weight']['mean']:.2f} | {profiles['HH_jit_L5_mean']['mean']:.4f} |"
+        )
+    md.extend(
+        [
+            "",
+            "![Feature mean heatmap](figures/07_feature_mean_heatmap.png)",
+            "",
+            "---\n",
+            "## 6. Data Quality and Dataset Size\n",
+            f"- Missing/null cells: **{total_nulls:,}**\n",
+            f"- Estimated completeness: **{summary['completeness_percent']:.2f}%**\n",
+            f"- Observed column counts: **{', '.join(str(value) for value in column_counts)}**\n",
+            "- Visualizations use per-file aggregates from `eda_summary.json`; packet-level boxplots and PCA require a separate row-sampling phase.\n",
+            "![Dataset size distribution](figures/06_dataset_size_distribution.png)",
+            "",
+            "---\n",
+            f"## 7. Complete Dataset Catalog ({total_files} Datasets)\n",
+            "| Device | Class | Attack | Records | Size (MB) | Mean Packet Size (MI_dir_L5_mean) |",
+            "|---|---|---|---:|---:|---:|",
+        ]
+    )
+    for m in sorted(
+        metrics,
+        key=lambda x: (x.device_category, x.device_name, x.attack_family, x.attack_name),
+    ):
+        pkt_sz = m.selected_feature_means.get("MI_dir_L5_mean", 0.0)
+        md.append(
+            f"| {m.device_name} | `{m.attack_family}` | `{m.attack_name}` | {m.row_count:,} | {m.file_size_mb:,.2f} | {pkt_sz:.2f} |"
+        )
+
+    return "\n".join(md)
+
+
 def run_eda_pipeline():
     start_time = time.time()
     workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -268,6 +564,18 @@ def run_eda_pipeline():
         print(f" Done ({m.row_count:,} rows, {m.file_size_mb:.1f} MB)")
 
     elapsed = time.time() - start_time
+    summary = summarize_metrics(metrics_list)
+
+    # Generate static figures from the aggregate JSON data. This keeps the
+    # visualization step separate from the large CSV scan and works offline.
+    try:
+        from generate_eda_visuals import generate_visualizations
+
+        figures_dir = os.path.join(reports_dir, "figures")
+        generate_visualizations(summary, metrics_list, figures_dir)
+        print(f"Saved static visualizations to {figures_dir}")
+    except ImportError as exc:
+        print(f"[WARN] Static visualizations skipped: {exc}")
 
     # Generate Markdown Report
     md_content = generate_markdown(metrics_list, elapsed)
@@ -284,6 +592,7 @@ def run_eda_pipeline():
         "total_datasets": len(metrics_list),
         "total_records": sum(m.row_count for m in metrics_list),
         "total_size_mb": round(sum(m.file_size_mb for m in metrics_list), 2),
+        "summary": summary,
         "datasets": [asdict(m) for m in metrics_list],
     }
     with open(json_output_path, "w", encoding="utf-8") as f:

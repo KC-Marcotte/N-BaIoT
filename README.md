@@ -2,12 +2,13 @@
 
 Tools and notes for working with the N-BaIoT IoT botnet dataset.
 
-The raw dataset is not included in Git because it is large. Put it in `data/` before running the tests or reports.
+The raw dataset is intentionally not included in Git. Place a local copy in
+`data/` before running the tests or reports.
 
 ## Setup
 
 ```bash
-pip install pandas numpy pytest
+pip install pandas numpy matplotlib pytest
 ```
 
 ## Use
@@ -24,11 +25,19 @@ Build the EDA reports:
 python scripts/generate_eda_report.py
 ```
 
+This creates the Markdown and JSON reports plus offline PNG figures under
+`reports/figures/`. To regenerate only the figures from an existing JSON
+summary:
+
+```bash
+python scripts/generate_eda_visuals.py
+```
+
 ## Folders
 
 - `data/` — local dataset files, not tracked
 - `docs/` — paper and dataset references
-- `reports/` — EDA output
+- `reports/` — EDA output, including `eda_report.md`, `eda_summary.json`, and `figures/`
 - `scripts/` — data and report tools
 - `tests/` — dataset checks
 

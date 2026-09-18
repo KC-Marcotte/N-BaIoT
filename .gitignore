@@ -6,9 +6,6 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Raw dataset files (7.58 GB volume; download separately per documentation)
-data/
-
 # OS and editor artifacts
 .DS_Store
 Thumbs.db
@@ -18,3 +15,6 @@ desktop.ini
 *.temp
 .vscode/
 .idea/
+
+# Local N-BaIoT dataset (large files; keep outside the Git repository)
+data/
